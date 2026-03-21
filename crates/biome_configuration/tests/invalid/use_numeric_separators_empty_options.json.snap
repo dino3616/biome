@@ -1,0 +1,57 @@
+---
+source: crates/biome_configuration/tests/spec_tests.rs
+assertion_line: 64
+expression: use_numeric_separators_empty_options.json
+---
+use_numeric_separators_empty_options.json:9:17 deserialize ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × At least one field among minimumDigits and groupLength must be set for binary.
+  
+     7 │ 					"level": "error",
+     8 │ 					"options": {
+   > 9 │ 						"binary": {},
+       │ 						          ^^
+    10 │ 						"octal": {},
+    11 │ 						"decimal": {},
+  
+
+
+
+use_numeric_separators_empty_options.json:10:16 deserialize ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × At least one field among minimumDigits and groupLength must be set for octal.
+  
+     8 │ 					"options": {
+     9 │ 						"binary": {},
+  > 10 │ 						"octal": {},
+       │ 						         ^^
+    11 │ 						"decimal": {},
+    12 │ 						"hexadecimal": {}
+  
+
+
+
+use_numeric_separators_empty_options.json:11:18 deserialize ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × At least one field among minimumDigits and groupLength must be set for decimal.
+  
+     9 │ 						"binary": {},
+    10 │ 						"octal": {},
+  > 11 │ 						"decimal": {},
+       │ 						           ^^
+    12 │ 						"hexadecimal": {}
+    13 │ 					}
+  
+
+
+
+use_numeric_separators_empty_options.json:12:22 deserialize ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  × At least one field among minimumDigits and groupLength must be set for hexadecimal.
+  
+    10 │ 						"octal": {},
+    11 │ 						"decimal": {},
+  > 12 │ 						"hexadecimal": {}
+       │ 						               ^^
+    13 │ 					}
+    14 │ 				}

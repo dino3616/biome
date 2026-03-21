@@ -4,7 +4,9 @@ use biome_analyze::{
 use biome_console::markup;
 use biome_js_syntax::{JsNumberLiteralExpression, JsSyntaxToken};
 use biome_rowan::{AstNode, BatchMutationExt};
-use biome_rule_options::use_numeric_separators::UseNumericSeparatorsOptions;
+use biome_rule_options::use_numeric_separators::{
+    NumericLiteralSeparatorOptions, UseNumericSeparatorsOptions,
+};
 
 use crate::JsRuleAction;
 
@@ -52,6 +54,112 @@ declare_lint_rule! {
     /// var a = 0b1100_1100;
     /// ```
     ///
+    /// ## Options
+    ///
+    /// ### `<numeric literal type>`
+    ///
+    /// Each numeric literal type (`binary`, `octal`, `decimal`, and `hexadecimal`) can be configured with its own options object. Sub-options such as `minimumDigits` and `groupLength` go under the numeric literal type they apply to.
+    ///
+    /// ```json,options
+    /// {
+    ///     "options": {
+    ///         "decimal": {
+    ///             "minimumDigits": 7,
+    ///             "groupLength": 3
+    ///         },
+    ///         "hexadecimal": {
+    ///             "minimumDigits": 4,
+    ///             "groupLength": 2
+    ///         }
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// ### `<numeric literal type>.minimumDigits`
+    ///
+    /// Minimum number of digits required before adding separators. For example, with `minimumDigits` set to `5`, the number `1234` would not require separators, but `12345` would be expected to be formatted as `12_345`.
+    ///
+    /// Default values for `minimumDigits` vary by numeric literal type:
+    /// - `binary`: `0`
+    /// - `octal`: `0`
+    /// - `decimal`: `5`
+    /// - `hexadecimal`: `0`
+    ///
+    /// #### Invalid
+    ///
+    /// ```json,options
+    /// {
+    ///    "options": {
+    ///       "decimal": {
+    ///          "minimumDigits": 8
+    ///       }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// ```js,use_options,expect_diagnostic
+    /// 12345678;
+    /// ```
+    ///
+    /// #### Valid
+    ///
+    /// ```json,options
+    /// {
+    ///    "options": {
+    ///       "decimal": {
+    ///          "minimumDigits": 8
+    ///       }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// ```js,use_options
+    /// 1234;
+    /// 12_345_678;
+    /// ```
+    ///
+    /// ### `<numeric literal type>.groupLength`
+    ///
+    /// Number of digits between separators.
+    ///
+    /// Default values for `groupLength` vary by numeric literal type:
+    /// - `binary`: `4`
+    /// - `octal`: `4`
+    /// - `decimal`: `3`
+    /// - `hexadecimal`: `2`
+    ///
+    /// #### Invalid
+    ///
+    /// ```json,options
+    /// {
+    ///    "options": {
+    ///       "decimal": {
+    ///          "groupLength": 5
+    ///       }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// ```js,use_options,expect_diagnostic
+    /// 123_451_2345;
+    /// ```
+    ///
+    /// #### Valid
+    ///
+    /// ```json,options
+    /// {
+    ///    "options": {
+    ///       "decimal": {
+    ///          "groupLength": 5
+    ///       }
+    ///    }
+    /// }
+    /// ```
+    ///
+    /// ```js,use_options
+    /// 12345_12345;
+    /// ```
+    ///
     pub UseNumericSeparators {
         version: "2.0.0",
         name: "useNumericSeparators",
@@ -77,12 +185,12 @@ impl Rule for UseNumericSeparators {
             return None;
         }
 
-        let expected = format_numeric_literal(raw);
+        let analysis = analyze_numeric_literal(raw, ctx.options());
 
-        if raw == expected {
+        if analysis.is_formatted {
             None
         } else if raw.contains('_') {
-            if expected.contains('_') {
+            if analysis.needs_separators {
                 // Contains separators, but not in the same places as the expected value.
                 Some(State::InconsistentGrouping)
             } else {
@@ -122,7 +230,7 @@ impl Rule for UseNumericSeparators {
 
     fn action(ctx: &RuleContext<Self>, state: &Self::State) -> Option<JsRuleAction> {
         let token = ctx.query().value_token().ok()?;
-        let num = format_numeric_literal(token.text_trimmed());
+        let num = format_numeric_literal(token.text_trimmed(), ctx.options());
 
         let new_token = JsSyntaxToken::new_detached(token.kind(), &num, [], []);
         let mut mutation = ctx.root().begin();
@@ -148,14 +256,190 @@ pub enum State {
     UnnecessaryGrouping,
 }
 
-// Options for the minimum length of a number required before adding separators and the length of digit groups between separators, respectively.
-const BINARY_OPTS: (usize, usize) = (0, 4);
-const OCTAL_OPTS: (usize, usize) = (0, 4);
-const DECIMAL_OPTS: (usize, usize) = (5, 3);
-const HEXADECIMAL_OPTS: (usize, usize) = (0, 2);
+struct NumericLiteralAnalysis {
+    is_formatted: bool,
+    needs_separators: bool,
+}
+
+struct ChunkAnalysis {
+    is_formatted: bool,
+    needs_separators: bool,
+}
+
+/// Analyzes a numeric literal without allocating the formatted representation.
+fn analyze_numeric_literal(
+    raw: &str,
+    options: &UseNumericSeparatorsOptions,
+) -> NumericLiteralAnalysis {
+    let bytes = raw.as_bytes();
+    let mut current_num_start = 0;
+
+    let mut is_formatted = true;
+    let mut needs_separators = false;
+
+    let mut is_base_10 = true;
+    let mut in_fraction = false;
+    let mut prefix_parsed = false;
+
+    let mut separator_options = resolved_separator_options(
+        options.decimal.as_ref(),
+        UseNumericSeparatorsOptions::DEFAULT_DECIMAL_MIN_DIGITS,
+        UseNumericSeparatorsOptions::DEFAULT_DECIMAL_GROUP_LENGTH,
+    );
+
+    let mut index = 0;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'_' => {}
+            b'0' if !prefix_parsed && !in_fraction => {
+                if let Some(&next) = bytes.get(index + 1) {
+                    let opts = match next {
+                        b'b' | b'B' => Some(resolved_separator_options(
+                            options.binary.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_BINARY_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_BINARY_GROUP_LENGTH,
+                        )),
+                        b'o' | b'O' | b'0'..=b'7' => Some(resolved_separator_options(
+                            options.octal.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_OCTAL_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_OCTAL_GROUP_LENGTH,
+                        )),
+                        b'x' | b'X' => Some(resolved_separator_options(
+                            options.hexadecimal.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_HEXADECIMAL_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_HEXADECIMAL_GROUP_LENGTH,
+                        )),
+                        _ => None,
+                    };
+
+                    if let Some(opts) = opts {
+                        separator_options = opts;
+                        is_base_10 = false;
+                        prefix_parsed = true;
+                        current_num_start = index + 2;
+                        index += 1;
+                    }
+                }
+            }
+            b'e' | b'E' if is_base_10 => {
+                let analysis = analyze_number_chunk(
+                    &bytes[current_num_start..index],
+                    in_fraction,
+                    &separator_options,
+                );
+                is_formatted &= analysis.is_formatted;
+                needs_separators |= analysis.needs_separators;
+                current_num_start = index + 1;
+                in_fraction = false;
+            }
+            b'.' => {
+                let analysis = analyze_number_chunk(
+                    &bytes[current_num_start..index],
+                    false,
+                    &separator_options,
+                );
+                is_formatted &= analysis.is_formatted;
+                needs_separators |= analysis.needs_separators;
+                current_num_start = index + 1;
+                in_fraction = true;
+            }
+            b'-' | b'+' => {
+                current_num_start = index + 1;
+            }
+            b if b.is_ascii_alphanumeric() => {
+                prefix_parsed = true;
+            }
+
+            _ => panic!("unexpected byte '{byte}'",),
+        }
+
+        index += 1;
+    }
+
+    let analysis =
+        analyze_number_chunk(&bytes[current_num_start..], in_fraction, &separator_options);
+    is_formatted &= analysis.is_formatted;
+    needs_separators |= analysis.needs_separators;
+
+    NumericLiteralAnalysis {
+        is_formatted,
+        needs_separators,
+    }
+}
+
+fn analyze_number_chunk(
+    raw: &[u8],
+    left_aligned: bool,
+    separator_options: &NumericLiteralSeparatorOptions,
+) -> ChunkAnalysis {
+    let min_digits = separator_options.minimum_digits.unwrap_or_default() as usize;
+    let group_len = separator_options.group_length.unwrap_or_default() as usize;
+    let digit_count = raw.iter().filter(|&&byte| byte != b'_').count();
+    let needs_separators = digit_count >= min_digits && digit_count > group_len;
+
+    let mut current_digit = 0;
+    let mut consumed_separator = false;
+    let mut is_formatted = true;
+
+    for &byte in raw {
+        let should_have_separator = needs_separators
+            && current_digit > 0
+            && if left_aligned {
+                current_digit % group_len == 0
+            } else {
+                (digit_count - current_digit) % group_len == 0
+            };
+
+        if byte == b'_' {
+            if !needs_separators || !should_have_separator || consumed_separator {
+                is_formatted = false;
+                break;
+            }
+
+            consumed_separator = true;
+            continue;
+        }
+
+        if should_have_separator && !consumed_separator {
+            is_formatted = false;
+            break;
+        }
+
+        consumed_separator = false;
+        current_digit += 1;
+    }
+
+    if is_formatted && current_digit != digit_count {
+        is_formatted = false;
+    }
+
+    ChunkAnalysis {
+        is_formatted,
+        needs_separators,
+    }
+}
+
+fn resolved_separator_options(
+    options: Option<&NumericLiteralSeparatorOptions>,
+    default_min_digits: u8,
+    default_group_length: u8,
+) -> NumericLiteralSeparatorOptions {
+    NumericLiteralSeparatorOptions {
+        minimum_digits: Some(
+            options
+                .and_then(|options| options.minimum_digits)
+                .unwrap_or(default_min_digits),
+        ),
+        group_length: Some(
+            options
+                .and_then(|options| options.group_length)
+                .unwrap_or(default_group_length),
+        ),
+    }
+}
 
 /// Formats all parts of a numeric literal by adding separators between groups of digits when appropriate.
-fn format_numeric_literal(raw: &str) -> String {
+fn format_numeric_literal(raw: &str, options: &UseNumericSeparatorsOptions) -> String {
     let mut bytes = raw.bytes().peekable();
     let mut result = Vec::new();
     let mut current_num = Vec::new();
@@ -164,7 +448,11 @@ fn format_numeric_literal(raw: &str) -> String {
     let mut in_fraction = false;
     let mut prefix_parsed = false;
 
-    let (mut min_digits, mut group_len) = DECIMAL_OPTS;
+    let mut separator_options = resolved_separator_options(
+        options.decimal.as_ref(),
+        UseNumericSeparatorsOptions::DEFAULT_DECIMAL_MIN_DIGITS,
+        UseNumericSeparatorsOptions::DEFAULT_DECIMAL_GROUP_LENGTH,
+    );
 
     while let Some(b) = bytes.next() {
         match b {
@@ -172,14 +460,26 @@ fn format_numeric_literal(raw: &str) -> String {
             b'0' if !prefix_parsed && !in_fraction => {
                 if let Some(&next) = bytes.peek() {
                     let opts = match next {
-                        b'b' | b'B' => Some(BINARY_OPTS),
-                        b'o' | b'O' | b'0'..=b'7' => Some(OCTAL_OPTS),
-                        b'x' | b'X' => Some(HEXADECIMAL_OPTS),
+                        b'b' | b'B' => Some(resolved_separator_options(
+                            options.binary.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_BINARY_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_BINARY_GROUP_LENGTH,
+                        )),
+                        b'o' | b'O' | b'0'..=b'7' => Some(resolved_separator_options(
+                            options.octal.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_OCTAL_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_OCTAL_GROUP_LENGTH,
+                        )),
+                        b'x' | b'X' => Some(resolved_separator_options(
+                            options.hexadecimal.as_ref(),
+                            UseNumericSeparatorsOptions::DEFAULT_HEXADECIMAL_MIN_DIGITS,
+                            UseNumericSeparatorsOptions::DEFAULT_HEXADECIMAL_GROUP_LENGTH,
+                        )),
                         _ => None,
                     };
 
                     if let Some(opts) = opts {
-                        (min_digits, group_len) = opts;
+                        separator_options = opts;
                         result.push(b);
                         // SAFETY: We already peeked and confirmed the existence of the `next` byte, so we can safely advance the iterator and push the value immediately.
                         result.push(bytes.next().unwrap());
@@ -194,20 +494,14 @@ fn format_numeric_literal(raw: &str) -> String {
                 result.extend(&insert_separators(
                     &current_num,
                     in_fraction,
-                    min_digits,
-                    group_len,
+                    &separator_options,
                 ));
                 result.push(b);
                 current_num.clear();
                 in_fraction = false;
             }
             b'.' => {
-                result.extend(insert_separators(
-                    &current_num,
-                    false,
-                    min_digits,
-                    group_len,
-                ));
+                result.extend(insert_separators(&current_num, false, &separator_options));
                 result.push(b);
                 current_num.clear();
                 in_fraction = true;
@@ -225,8 +519,7 @@ fn format_numeric_literal(raw: &str) -> String {
     result.extend(insert_separators(
         &current_num,
         in_fraction,
-        min_digits,
-        group_len,
+        &separator_options,
     ));
 
     // SAFETY: The original string is valid UTF-8 so we can be confident here that the result is valid as well.
@@ -249,9 +542,10 @@ fn format_numeric_literal(raw: &str) -> String {
 fn insert_separators(
     number: &[u8],
     left_aligned: bool,
-    min_digits: usize,
-    group_len: usize,
+    separator_options: &NumericLiteralSeparatorOptions,
 ) -> Vec<u8> {
+    let min_digits = separator_options.minimum_digits.unwrap_or_default() as usize;
+    let group_len = separator_options.group_length.unwrap_or_default() as usize;
     if number.len() < min_digits {
         // Don't insert separators if the number is shorter than the minimum number of digits required to start adding separators.
         number.to_vec()
