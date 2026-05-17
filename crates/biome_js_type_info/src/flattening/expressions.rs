@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
 use biome_rowan::Text;
@@ -23,10 +24,41 @@ use crate::{
     },
 };
 
+const MAX_CALLEE_RESOLUTION_DEPTH: u16 = 64;
+
+thread_local! {
+    static CALLEE_RESOLUTION_DEPTH: Cell<u16> = const { Cell::new(0) };
+}
+
+struct CalleeResolutionGuard;
+
+impl CalleeResolutionGuard {
+    fn enter() -> Option<Self> {
+        CALLEE_RESOLUTION_DEPTH.with(|depth| {
+            let current = depth.get();
+            if current >= MAX_CALLEE_RESOLUTION_DEPTH {
+                None
+            } else {
+                depth.set(current + 1);
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for CalleeResolutionGuard {
+    fn drop(&mut self) {
+        CALLEE_RESOLUTION_DEPTH.with(|depth| {
+            depth.set(depth.get().saturating_sub(1));
+        });
+    }
+}
+
 pub(super) fn flattened_expression(
     expr: &TypeofExpression,
     resolver: &mut dyn TypeResolver,
 ) -> Option<TypeData> {
+    let _guard = CalleeResolutionGuard::enter()?;
     match expr {
         TypeofExpression::Addition(expr) => {
             let left = resolver.resolve_and_get(&expr.left)?;
